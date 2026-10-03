@@ -1,5 +1,6 @@
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Reflection;
 using PathVeer.Service.Cloud;
 using Xunit;
 
@@ -250,6 +251,26 @@ public sealed class CloudStateSecurityTests
     }
 
     [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseWhenOnlyAdministratorsReadNotFullControl()
+    {
+        var ds = new DirectorySecurity();
+        ds.SetOwner(s_system);
+        ds.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        ds.AddAccessRule(new FileSystemAccessRule(
+            s_system, FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit
+            | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Allow));
+        ds.AddAccessRule(new FileSystemAccessRule(
+            s_administrators, FileSystemRights.Read,
+            InheritanceFlags.ContainerInherit
+            | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Allow));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
     public void IsCanonicalSecurityDescriptor_FalseWhenOnlyReadNotFullControl()
     {
         var ds = new DirectorySecurity();
@@ -270,12 +291,8 @@ public sealed class CloudStateSecurityTests
     }
 
     [Fact]
-    public void IsCanonicalSecurityDescriptor_DenyAceForUnauthorizedSidDoesNotBreakAllowSet()
+    public void IsCanonicalSecurityDescriptor_FalseForEveryoneDenyAce()
     {
-        // A DENY ACE for an unauthorized SID is not an access grant and is
-        // wiped by ApplyCanonicalAcl (which resets the whole DACL). The
-        // canonical definition validates the ALLOW set, so a deny does not
-        // make an otherwise-canonical descriptor invalid.
         var ds = CanonicalDirectoryDescriptor();
         ds.AddAccessRule(new FileSystemAccessRule(
             s_everyone, FileSystemRights.FullControl,
@@ -283,6 +300,306 @@ public sealed class CloudStateSecurityTests
             | InheritanceFlags.ObjectInherit,
             PropagationFlags.None, AccessControlType.Deny));
 
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForSystemDenyAce()
+    {
+        var ds = CanonicalDirectoryDescriptor();
+        ds.AddAccessRule(new FileSystemAccessRule(
+            s_system, FileSystemRights.Read,
+            InheritanceFlags.ContainerInherit
+            | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Deny));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForSystemWrongInheritanceFlags()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForAdministratorsWrongInheritanceFlags()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ObjectInherit));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForSystemWrongPropagationFlags()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit,
+                PropagationFlags.InheritOnly),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForAdministratorsWrongPropagationFlags()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit,
+                PropagationFlags.InheritOnly));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForFileAceWithDirectoryInheritance()
+    {
+        var raw = RawDescriptorBinary(
+            isDirectory: false,
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl));
+
+        // FileSecurity normalizes directory-only inheritance bits away when the
+        // binary descriptor is loaded. Exercise the same production raw-DACL
+        // validator before that platform normalization instead.
+        Assert.False(
+            CloudStateSecurity.IsCanonicalSecurityDescriptor(
+                raw, isDirectory: false));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForFileAceWithPropagationFlags()
+    {
+        var raw = RawDescriptorBinary(
+            isDirectory: false,
+            Ace(s_system, FileSystemRights.FullControl,
+                propagation: PropagationFlags.InheritOnly),
+            Ace(s_administrators, FileSystemRights.FullControl));
+
+        Assert.False(
+            CloudStateSecurity.IsCanonicalSecurityDescriptor(
+                raw, isDirectory: false));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForExtraRightsBeyondFullControl()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system,
+                FileSystemRights.FullControl
+                | (FileSystemRights)0x40000000,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForDuplicateSystemAce()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            // A second approved SYSTEM identity with a different qualifier
+            // remains physically present in the raw DACL and must still be
+            // rejected as a duplicate identity.
+            Ace(s_system, FileSystemRights.Read,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit,
+                type: AccessControlType.Deny));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForDuplicateAdministratorsAce()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit),
+            Ace(s_administrators, FileSystemRights.Read,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit,
+                type: AccessControlType.Deny));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void IsCanonicalSecurityDescriptor_FalseForInheritedAce()
+    {
+        var ds = RawDirectoryDescriptor(
+            Ace(s_system, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit,
+                isInherited: true),
+            Ace(s_administrators, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit
+                | InheritanceFlags.ObjectInherit));
+
+        Assert.False(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void ApplyCanonicalAcl_ProducesExactDirectoryDescriptor()
+    {
+        var ds = new DirectorySecurity();
+        ds.SetOwner(s_arbitraryUser);
+        ds.AddAccessRule(new FileSystemAccessRule(
+            s_everyone, FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit
+            | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Deny));
+
+        InvokeApplyCanonicalAcl(ds);
+
         Assert.True(CloudStateSecurity.IsCanonicalSecurityDescriptor(ds));
+    }
+
+    [Fact]
+    public void ApplyCanonicalAcl_ProducesExactFileDescriptor()
+    {
+        var fs = new FileSecurity();
+        fs.SetOwner(s_arbitraryUser);
+        fs.AddAccessRule(new FileSystemAccessRule(
+            s_everyone, FileSystemRights.FullControl,
+            AccessControlType.Deny));
+
+        InvokeApplyCanonicalAcl(fs);
+
+        Assert.True(CloudStateSecurity.IsCanonicalSecurityDescriptor(fs));
+    }
+
+    private static void InvokeApplyCanonicalAcl(ObjectSecurity security)
+    {
+        MethodInfo? method = typeof(CloudStateSecurity).GetMethod(
+            "ApplyCanonicalAcl",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+        method!.Invoke(null, new object[] { security });
+    }
+
+    private readonly record struct AceSpec(
+        SecurityIdentifier Sid,
+        FileSystemRights Rights,
+        InheritanceFlags Inheritance,
+        PropagationFlags Propagation,
+        AccessControlType Type,
+        bool IsInherited);
+
+    private static AceSpec Ace(
+        SecurityIdentifier sid,
+        FileSystemRights rights,
+        InheritanceFlags inheritance = InheritanceFlags.None,
+        PropagationFlags propagation = PropagationFlags.None,
+        AccessControlType type = AccessControlType.Allow,
+        bool isInherited = false) =>
+        new(sid, rights, inheritance, propagation, type, isInherited);
+
+    private static DirectorySecurity RawDirectoryDescriptor(
+        params AceSpec[] aces) =>
+        (DirectorySecurity)RawDescriptor(isDirectory: true, aces);
+
+    private static RawSecurityDescriptor RawDescriptorBinary(
+        bool isDirectory,
+        params AceSpec[] aces) =>
+        RawDescriptorBinary(isDirectory, (IReadOnlyList<AceSpec>)aces);
+
+    private static RawSecurityDescriptor RawDescriptorBinary(
+        bool isDirectory,
+        IReadOnlyList<AceSpec> aces)
+    {
+        var dacl = new RawAcl(revision: 2, capacity: aces.Count);
+        foreach (AceSpec spec in aces)
+        {
+            AceFlags flags = ToAceFlags(spec);
+            AceQualifier qualifier = spec.Type == AccessControlType.Allow
+                ? AceQualifier.AccessAllowed
+                : AceQualifier.AccessDenied;
+            dacl.InsertAce(
+                dacl.Count,
+                new CommonAce(
+                    flags,
+                    qualifier,
+                    (int)spec.Rights,
+                    spec.Sid,
+                    isCallback: false,
+                    opaque: null));
+        }
+
+        return new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent
+            | ControlFlags.DiscretionaryAclProtected
+            | ControlFlags.SelfRelative,
+            s_system,
+            s_system,
+            systemAcl: null,
+            discretionaryAcl: dacl);
+    }
+
+    private static FileSystemSecurity RawDescriptor(
+        bool isDirectory,
+        IReadOnlyList<AceSpec> aces)
+    {
+        RawSecurityDescriptor descriptor =
+            RawDescriptorBinary(isDirectory, aces);
+        byte[] bytes = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(bytes, 0);
+
+        FileSystemSecurity security = isDirectory
+            ? new DirectorySecurity()
+            : new FileSecurity();
+        security.SetSecurityDescriptorBinaryForm(bytes);
+        return security;
+    }
+
+    private static AceFlags ToAceFlags(AceSpec spec)
+    {
+        AceFlags flags = AceFlags.None;
+        if (spec.Inheritance.HasFlag(InheritanceFlags.ContainerInherit))
+            flags |= AceFlags.ContainerInherit;
+        if (spec.Inheritance.HasFlag(InheritanceFlags.ObjectInherit))
+            flags |= AceFlags.ObjectInherit;
+        if (spec.Propagation.HasFlag(PropagationFlags.NoPropagateInherit))
+            flags |= AceFlags.NoPropagateInherit;
+        if (spec.Propagation.HasFlag(PropagationFlags.InheritOnly))
+            flags |= AceFlags.InheritOnly;
+        if (spec.IsInherited)
+            flags |= AceFlags.Inherited;
+        return flags;
     }
 }

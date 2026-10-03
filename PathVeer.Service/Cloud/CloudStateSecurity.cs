@@ -198,14 +198,14 @@ public static class CloudStateSecurity
 
     /// <summary>
     /// Pure validation of a CANONICAL Cloud security descriptor. True only when:
-    /// inheritance is disabled; the OWNER is SYSTEM; and every discretionary
-    /// allow ACE is exactly one of the approved identities (SYSTEM,
-    /// Administrators) with FullControl. Any other allow ACE (Everyone,
-    /// Authenticated Users, BUILTIN\Users, an arbitrary user/group SID, CREATOR
-    /// OWNER) OR a non-SYSTEM owner makes this FALSE — the owner implicitly
-    /// holds WRITE_DAC and could rewrite the DACL even when no ACE grants them
-    /// access. This is the SINGLE definition of canonical, shared by
-    /// <see cref="IsSecured"/> and <see cref="ApplyCanonicalAcl"/>.
+    /// inheritance is disabled; the OWNER is SYSTEM; and the DACL contains
+    /// exactly two explicit Allow ACEs: one SYSTEM ACE and one Administrators
+    /// ACE. Each ACE must have exactly FileSystemRights.FullControl and the
+    /// exact directory/file inheritance and propagation shape emitted by
+    /// <see cref="ApplyCanonicalAcl"/>. Any Deny, inherited, duplicate,
+    /// unauthorized, extra-rights, or wrongly-shaped ACE makes this FALSE.
+    /// This is the SINGLE definition of canonical, shared by <see cref="IsSecured"/>
+    /// and <see cref="ApplyCanonicalAcl"/>.
     /// </summary>
     /// <remarks>
     /// Internal (not public) so unit tests can verify descriptor logic without
@@ -216,11 +216,22 @@ public static class CloudStateSecurity
     internal static bool IsCanonicalSecurityDescriptor(
         ObjectSecurity security)
     {
-        var fsSecurity = (FileSystemSecurity)security;
+        if (security is not FileSystemSecurity fsSecurity)
+        {
+            return false;
+        }
+
+        bool isDirectory = security is DirectorySecurity;
+        bool isFile = security is FileSecurity;
+        if (!isDirectory && !isFile)
+        {
+            return false;
+        }
 
         if (!fsSecurity.AreAccessRulesProtected)
         {
-            // Inheritance still enabled -> inherits the parent Users-read ACL.
+            // Inheritance still enabled -> the permissive parent Users-read ACL
+            // could leak in.
             return false;
         }
 
@@ -235,42 +246,111 @@ public static class CloudStateSecurity
             return false;
         }
 
+        FileSystemRights canonicalRights = FileSystemRights.FullControl;
+        InheritanceFlags canonicalInheritance = isDirectory
+            ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit
+            : InheritanceFlags.None;
+
+        // Validate the raw DACL first. GetAccessRules can coalesce equivalent
+        // ACEs, which would hide duplicate physical ACEs and defeat the exact
+        // descriptor contract. RawSecurityDescriptor preserves the actual ACE
+        // count, qualifier, mask, SID, and inheritance bits.
+        var raw = new RawSecurityDescriptor(
+            fsSecurity.GetSecurityDescriptorBinaryForm(),
+            0);
+        if (!IsCanonicalSecurityDescriptor(raw, isDirectory))
+        {
+            return false;
+        }
+
+        // Keep the managed rule view fail-closed as well. In particular, an
+        // inherited rule exposed by GetAccessRules is never silently ignored.
+        FileSystemAccessRule[] rules = fsSecurity
+            .GetAccessRules(
+                includeExplicit: true,
+                includeInherited: true,
+                typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToArray();
+        if (rules.Length != 2)
+        {
+            return false;
+        }
+
+        foreach (FileSystemAccessRule rule in rules)
+        {
+            if (rule.AccessControlType != AccessControlType.Allow
+                || rule.IsInherited
+                || rule.FileSystemRights != canonicalRights
+                || rule.InheritanceFlags != canonicalInheritance
+                || rule.PropagationFlags != PropagationFlags.None)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Validates the raw descriptor shape used by the ObjectSecurity overload.
+    /// This internal seam lets tests exercise malformed ACEs before Windows
+    /// normalizes shapes that cannot exist on a concrete FileSecurity object.
+    /// </summary>
+    internal static bool IsCanonicalSecurityDescriptor(
+        RawSecurityDescriptor security,
+        bool isDirectory)
+    {
+        if ((security.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0
+            || security.Owner == null
+            || security.Owner != s_system)
+        {
+            return false;
+        }
+
+        RawAcl? dacl = security.DiscretionaryAcl;
+        if (dacl == null || dacl.Count != 2)
+        {
+            return false;
+        }
+
+        FileSystemRights canonicalRights = FileSystemRights.FullControl;
+        AceFlags canonicalFlags = isDirectory
+            ? AceFlags.ContainerInherit | AceFlags.ObjectInherit
+            : AceFlags.None;
         bool systemFull = false;
         bool adminFull = false;
 
-        foreach (FileSystemAccessRule rule in
-                 fsSecurity.GetAccessRules(
-                     includeExplicit: true,
-                     includeInherited: true,
-                     typeof(SecurityIdentifier)))
+        for (int i = 0; i < dacl.Count; i++)
         {
-            if (rule.AccessControlType != AccessControlType.Allow)
+            if (dacl[i] is not CommonAce ace
+                || ace.AceQualifier != AceQualifier.AccessAllowed
+                || ace.AceFlags != canonicalFlags
+                || ace.AccessMask != (int)canonicalRights)
             {
-                continue;
+                return false;
             }
 
-            var sid = (SecurityIdentifier)rule.IdentityReference;
+            if (ace.SecurityIdentifier == s_system)
+            {
+                if (systemFull)
+                {
+                    return false;
+                }
 
-            if (sid == s_system)
-            {
-                if (rule.FileSystemRights.HasFlag(
-                        FileSystemRights.FullControl))
-                {
-                    systemFull = true;
-                }
+                systemFull = true;
             }
-            else if (sid == s_administrators)
+            else if (ace.SecurityIdentifier == s_administrators)
             {
-                if (rule.FileSystemRights.HasFlag(
-                        FileSystemRights.FullControl))
+                if (adminFull)
                 {
-                    adminFull = true;
+                    return false;
                 }
+
+                adminFull = true;
             }
             else
             {
-                // Any other allow ACE (Everyone, Authenticated Users, Users,
-                // arbitrary user/group, CREATOR OWNER, etc.) is unauthorized.
                 return false;
             }
         }
@@ -287,6 +367,14 @@ public static class CloudStateSecurity
     {
         // FileSystemSecurity exposes the public reset/remove API we need.
         var fsSecurity = (FileSystemSecurity)security;
+
+        // ApplyCanonicalAcl is also safe as a standalone canonicalization seam:
+        // callers normally protect inheritance immediately before invoking it,
+        // but the exact contract requires the helper itself to emit a protected
+        // descriptor as well.
+        fsSecurity.SetAccessRuleProtection(
+            isProtected: true,
+            preserveInheritance: false);
 
         // Canonicalize OWNER to SYSTEM. A non-SYSTEM owner (including an
         // attacker who pre-created the object) retains implicit WRITE_DAC and
