@@ -80,6 +80,26 @@ public sealed class IranDirectWorkerTests : IDisposable
     }
 
     [Fact]
+    public async Task CorruptState_StartupReconciliation_DoesNotInvokeExecutor()
+    {
+        await _configStore.SaveAsync(ConfigurationDefaults.Create() with
+        {
+            Enabled = true,
+            VpnProfilePath = @"C:\VPN\work.ovpn"
+        });
+
+        var harness = BuildHarness(out FakeExecutor executor);
+        await File.WriteAllBytesAsync(harness.StatePath, new byte[64]);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+
+        await RunUntilCanceled(harness.Worker, cts);
+
+        Assert.Equal(0, executor.CallCount);
+        Assert.Equal(0, harness.RouteManager.MutationCallCount);
+    }
+
+    [Fact]
     public async Task ValidEnabledConfiguration_Reconciles()
     {
         await _configStore.SaveAsync(ConfigurationDefaults.Create() with
@@ -146,8 +166,8 @@ public sealed class IranDirectWorkerTests : IDisposable
     {
         executor = new FakeExecutor();
 
-        StateRepository stateRepository = new(
-            Path.Combine(_tempDir, "state.json"));
+        string statePath = Path.Combine(_tempDir, "state.json");
+        StateRepository stateRepository = new(statePath);
         RouteInventoryStore routeInventory = new(
             Path.Combine(_tempDir, "route-inventory.json"));
         VpnEndpointInventoryStore endpointInventory = new(
@@ -213,7 +233,13 @@ public sealed class IranDirectWorkerTests : IDisposable
             recovery,
             NullLogger<PathVeerWorker>.Instance);
 
-        return new Harness(worker, pipeServer, controller);
+        return new Harness(
+            worker,
+            pipeServer,
+            controller,
+            stateRepository,
+            statePath,
+            routeManager);
     }
 
     [Fact]
@@ -244,15 +270,24 @@ public sealed class IranDirectWorkerTests : IDisposable
         public PathVeerWorker Worker { get; }
         public NoopPipeServer PipeServer { get; }
         public PathVeerController Controller { get; }
+        public StateRepository StateRepository { get; }
+        public FakeRouteManager RouteManager { get; }
+        public string StatePath { get; }
 
         public Harness(
             PathVeerWorker worker,
             NoopPipeServer pipeServer,
-            PathVeerController controller)
+            PathVeerController controller,
+            StateRepository stateRepository,
+            string statePath,
+            FakeRouteManager routeManager)
         {
             Worker = worker;
             PipeServer = pipeServer;
             Controller = controller;
+            StateRepository = stateRepository;
+            StatePath = statePath;
+            RouteManager = routeManager;
         }
     }
 
@@ -334,19 +369,27 @@ public sealed class IranDirectWorkerTests : IDisposable
 
     private sealed class FakeRouteManager : IRouteManager
     {
+        public int MutationCallCount { get; private set; }
+
         public Task<IReadOnlyList<SystemRoute>> GetIpv4RoutesAsync(
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<SystemRoute>>(Array.Empty<SystemRoute>());
 
         public Task AddRoutesAsync(
             IReadOnlyCollection<ManagedRoute> routes,
-            CancellationToken cancellationToken = default) =>
-            Task.CompletedTask;
+            CancellationToken cancellationToken = default)
+        {
+            MutationCallCount++;
+            return Task.CompletedTask;
+        }
 
         public Task DeleteRoutesAsync(
             IReadOnlyCollection<ManagedRoute> routes,
-            CancellationToken cancellationToken = default) =>
-            Task.CompletedTask;
+            CancellationToken cancellationToken = default)
+        {
+            MutationCallCount++;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class FakeDecisionBuilder : IRuntimeDecisionBuilder

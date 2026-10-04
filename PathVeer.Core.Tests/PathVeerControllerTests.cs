@@ -3,6 +3,7 @@ namespace PathVeer.Core.Tests;
 using System.Net;
 using PathVeer.Core.Configuration;
 using PathVeer.Core.Networking;
+using PathVeer.Core.Persistence;
 using PathVeer.Core.Prefixes;
 using PathVeer.Core.Routing;
 using PathVeer.Core.Runtime;
@@ -915,6 +916,121 @@ public sealed class IranDirectControllerTests
         Assert.True(total.Count >= 1);
     }
 
+    [Fact]
+    public async Task RunCycle_UnrecoverableCorruptState_DoesNotInvokeExecutor()
+    {
+        await using TestContext ctx = new();
+        ctx.DesiredEnabled = true;
+        ctx.DecisionPlan = new RuntimeExecutionPlan
+        {
+            Steps =
+            [
+                new RuntimeExecutionStep
+                {
+                    Kind = RuntimeExecutionStepKind.AddPrefixRoute,
+                    Identity = "route|id",
+                    DestinationPrefix = "203.0.113.0/24",
+                    Gateway = "192.0.2.1",
+                    InterfaceIndex = 10,
+                    Metric = 5,
+                    Description = "test"
+                }
+            ]
+        };
+        ctx.ExecutorResult = RuntimeExecutionResult.Completed([
+            new RuntimeExecutionStepResult
+            {
+                StepIdentity = "route|id",
+                Kind = RuntimeExecutionStepKind.AddPrefixRoute,
+                DestinationPrefix = "203.0.113.0/24",
+                Status = RuntimeExecutionStepStatus.Succeeded
+            }
+        ]);
+        await File.WriteAllBytesAsync(ctx.StatePath, new byte[64]);
+
+        await Assert.ThrowsAsync<PersistenceCorruptException>(
+            () => ctx.Controller.RunCycleAsync());
+
+        Assert.Equal(0, ctx.FakeExecutor.CallCount);
+        Assert.Equal(0, ctx.RouteManager.MutationCallCount);
+    }
+
+    [Fact]
+    public async Task RunCycle_CorruptStateWithValidBackup_RecoversBeforeExecutor()
+    {
+        await using TestContext ctx = new();
+        await ctx.StateRepository.SaveAsync(new PathVeerState
+        {
+            Gateway = "192.0.2.1"
+        });
+        await ctx.StateRepository.SaveAsync(new PathVeerState
+        {
+            Gateway = "192.0.2.2"
+        });
+        await File.WriteAllBytesAsync(ctx.StatePath, new byte[64]);
+
+        ctx.DesiredEnabled = true;
+        ctx.DecisionPlan = new RuntimeExecutionPlan
+        {
+            Steps =
+            [
+                new RuntimeExecutionStep
+                {
+                    Kind = RuntimeExecutionStepKind.AddPrefixRoute,
+                    Identity = "route|id",
+                    DestinationPrefix = "203.0.113.0/24",
+                    Gateway = "192.0.2.1",
+                    InterfaceIndex = 10,
+                    Metric = 5,
+                    Description = "test"
+                }
+            ]
+        };
+        ctx.ExecutorResult = RuntimeExecutionResult.Completed([
+            new RuntimeExecutionStepResult
+            {
+                StepIdentity = "route|id",
+                Kind = RuntimeExecutionStepKind.AddPrefixRoute,
+                DestinationPrefix = "203.0.113.0/24",
+                Status = RuntimeExecutionStepStatus.Succeeded
+            }
+        ]);
+
+        await ctx.Controller.RunCycleAsync();
+
+        Assert.Equal(1, ctx.FakeExecutor.CallCount);
+        Assert.True(File.Exists(ctx.StatePath + ".bak"));
+    }
+
+    [Fact]
+    public async Task RunCycle_MissingState_RetainsDefaultSemanticsAndExecutes()
+    {
+        await using TestContext ctx = new();
+        ctx.DesiredEnabled = true;
+        ctx.ExecutorResult = RuntimeExecutionResult.NoExecutionRequired();
+
+        Assert.False(File.Exists(ctx.StatePath));
+
+        await ctx.Controller.RunCycleAsync();
+
+        Assert.Equal(1, ctx.FakeExecutor.CallCount);
+        Assert.True(File.Exists(ctx.StatePath));
+    }
+
+    [Fact]
+    public async Task Enable_UnrecoverableCorruptState_DoesNotInvokeExecutor()
+    {
+        await using TestContext ctx = new();
+        ctx.DesiredEnabled = true;
+        await File.WriteAllBytesAsync(ctx.StatePath, new byte[64]);
+
+        await Assert.ThrowsAsync<PersistenceCorruptException>(
+            () => ctx.Controller.EnableAsync());
+
+        Assert.Equal(0, ctx.FakeExecutor.CallCount);
+        Assert.Equal(0, ctx.RouteManager.MutationCallCount);
+    }
+
     internal sealed class FakeDecisionBuilder : IRuntimeDecisionBuilder
     {
         public RuntimeDecision? Decision { get; set; }
@@ -929,6 +1045,8 @@ public sealed class IranDirectControllerTests
 
     internal sealed class FakeExecutor : IRuntimeExecutor
     {
+        public int CallCount { get; private set; }
+
         public RuntimeExecutionResult Result { get; set; } =
             RuntimeExecutionResult.NoExecutionRequired();
 
@@ -942,6 +1060,7 @@ public sealed class IranDirectControllerTests
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            CallCount++;
             ExecutedPlan = plan;
 
             if (ThrowOnExecute is not null)
@@ -953,12 +1072,14 @@ public sealed class IranDirectControllerTests
 
     internal sealed class FakeRouteManager : IRouteManager
     {
+        public int MutationCallCount { get; private set; }
         public HashSet<string> Present { get; set; } = [];
 
         public Task AddRoutesAsync(
             IReadOnlyCollection<ManagedRoute> routes,
             CancellationToken cancellationToken = default)
         {
+            MutationCallCount++;
             foreach (ManagedRoute route in routes)
                 Present.Add(route.Identity);
             return Task.CompletedTask;
@@ -968,6 +1089,7 @@ public sealed class IranDirectControllerTests
             IReadOnlyCollection<ManagedRoute> routes,
             CancellationToken cancellationToken = default)
         {
+            MutationCallCount++;
             foreach (ManagedRoute route in routes)
                 Present.Remove(route.Identity);
             return Task.CompletedTask;
@@ -1002,6 +1124,8 @@ public sealed class IranDirectControllerTests
         public PathVeerController Controller { get; }
         public FakeExecutor FakeExecutor { get; }
         public FakeDecisionBuilder FakeDecisionBuilder { get; }
+        public FakeRouteManager RouteManager { get; }
+        public string StatePath => Path.Combine(_tempDir, "state.json");
         public RuntimeOperationStatus OperationStatus { get; }
         public RuntimeCycleProfiler Profiler { get; }
         public string? PerfDirectory { get; }
@@ -1067,7 +1191,7 @@ public sealed class IranDirectControllerTests
             PerfDirectory = perfDirectory;
 
             StateRepository = new StateRepository(
-                Path.Combine(_tempDir, "state.json"));
+                StatePath);
             RouteInventoryStore = new RouteInventoryStore(
                 Path.Combine(_tempDir, "route-inventory.json"));
             VpnEndpointInventoryStore endpointInventory = new(
@@ -1090,6 +1214,7 @@ public sealed class IranDirectControllerTests
             OperationStatus = new RuntimeOperationStatus();
 
             FakeRouteManager routeManager = new();
+            RouteManager = routeManager;
             GatewayDetector gatewayDetector = new();
             OpenVpnEndpointProvider vpnProvider = new(
                 Path.Combine(_tempDir, "vpn-profile.ovpn"),

@@ -460,11 +460,24 @@ public sealed class PathVeerController :
         }
     }
 
+    private async Task ValidateDurableStateAsync(
+        CancellationToken cancellationToken)
+    {
+        _ = await _stateRepository.LoadAsync(cancellationToken);
+    }
+
     private async Task<RuntimeCycleExecutionResult> RunCycleCoreAsync(
         CancellationToken cancellationToken = default)
     {
         try
         {
+            // Durable runtime state is an execution precondition, not desired
+            // state authority. LoadAsync preserves the existing semantics:
+            // missing state yields the existing default, valid state succeeds,
+            // a corrupt primary may recover from .bak, and unrecoverable
+            // corruption propagates before planning or route mutation.
+            await ValidateDurableStateAsync(cancellationToken);
+
             RuntimeDecision decision =
                 await _runtimeCycleCoordinator.RunCycleAsync(
                     cancellationToken);
