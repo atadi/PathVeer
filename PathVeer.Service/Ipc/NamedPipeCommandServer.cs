@@ -70,13 +70,26 @@ public class NamedPipeCommandServer
     public virtual async Task RunAsync(
         CancellationToken cancellationToken)
     {
+        await RunAsync(PathVeerPipeNames.AllListenNames, cancellationToken);
+    }
+
+    /// <summary>
+    /// Internal testing seam: run the SAME listener loop over an explicit set
+    /// of pipe names. Production always passes
+    /// <see cref="PathVeerPipeNames.AllListenNames"/>; tests pass an isolated
+    /// name so they cannot attach to a live PathVeer service on the machine
+    /// (which owns the real control pipe). No production behaviour changes —
+    /// this only widens where the existing, unmodified loop is pointed.
+    /// </summary>
+    internal async Task RunAsync(
+        IReadOnlyList<string> pipeNames,
+        CancellationToken cancellationToken)
+    {
         // Dual-listen: both the primary PathVeer pipe and the legacy
         // IranDirect pipe dispatch into the SAME command handler and the SAME
         // OperationCoordinator. There is exactly one authority; the two pipes
         // are two front doors into this single process. Each loop independently
         // accepts clients on its pipe and funnels them through HandleOneClientAsync.
-        IReadOnlyList<string> pipeNames = PathVeerPipeNames.AllListenNames;
-
         Task[] listeners = pipeNames
             .Select(name => RunOnePipeAsync(name, cancellationToken))
             .ToArray();
@@ -166,38 +179,29 @@ public class NamedPipeCommandServer
             await reader.ReadLineAsync(
                 cancellationToken);
 
+        // BOUNDARY 1 — INBOUND REQUEST PARSING ONLY.
+        //
+        // JsonException raised HERE means the caller's request document was not
+        // parseable into a ServiceRequest. That, and only that, is INVALID_JSON.
+        //
+        // ParseRequest contains nothing but deserialization and the
+        // shape/version checks that decide WHETHER to dispatch. It never
+        // invokes a command handler and never touches persistence, so any
+        // JsonException escaping it can only mean the REQUEST was malformed.
         ServiceResponse response;
+
+        ParsedRequest parsed;
 
         try
         {
-            ServiceRequest? request =
-                JsonSerializer.Deserialize<ServiceRequest>(
-                    requestJson ?? "",
-                    PathVeerJson.Options);
-
-            if (request is null)
-            {
-                response = Failure(
-                    "INVALID_REQUEST",
-                    "The request was invalid.");
-            }
-            else if (request.ProtocolVersion !=
-                     IpcProtocol.CurrentVersion)
-            {
-                response = Failure(
-                    "UNSUPPORTED_PROTOCOL",
-                    $"Protocol version " +
-                    $"{request.ProtocolVersion} is not supported.");
-            }
-            else
-            {
-                response = await ExecuteWithTelemetryAsync(
-                    request,
-                    cancellationToken);
-            }
+            parsed = ParseRequest(
+                requestJson ?? string.Empty);
         }
         catch (JsonException exception)
         {
+            // Boundary 1 only: the REQUEST document could not be parsed.
+            // Malformed request JSON must never dispatch a command, and the log
+            // event says exactly that (not "command failed").
             _logger.LogWarning(
                 exception,
                 "Invalid named-pipe JSON request.");
@@ -205,17 +209,54 @@ public class NamedPipeCommandServer
             response = Failure(
                 "INVALID_JSON",
                 "The request could not be parsed.");
+
+            goto WriteResponse;
+        }
+
+        if (parsed.Rejection is ServiceResponse rejection)
+        {
+            // A well-formed document that must not be dispatched: unknown
+            // protocol version, or a null/absent request body. These keep their
+            // established error codes (UNSUPPORTED_PROTOCOL / INVALID_REQUEST)
+            // and, like malformed input, never dispatch a command.
+            response = rejection;
+            goto WriteResponse;
+        }
+
+        // BOUNDARY 2 — COMMAND DISPATCH.
+        //
+        // From here on a ServiceRequest has been produced and validated, so any
+        // exception is a genuine COMMAND failure — never malformed input. A
+        // downstream JsonException (e.g. a corrupted durable state file
+        // surfacing from GetStatusAsync) and a downstream
+        // PersistenceCorruptException must NOT be reported as INVALID_JSON:
+        // doing so materially misdiagnoses persistence corruption as malformed
+        // IPC input.
+        try
+        {
+            response = await ExecuteWithTelemetryAsync(
+                parsed.Request!,
+                cancellationToken);
         }
         catch (Exception exception)
         {
+            // Boundary 2 only: a valid request failed during dispatch. Preserve
+            // the established COMMAND_FAILED contract. The real exception
+            // category is recorded by IpcDispatchTelemetry.CompleteFailure
+            // (exception TYPE, no string/stack-trace inspection) and the full
+            // exception is logged server-side; the response message is fixed so
+            // raw persisted state, credentials, enrollment codes, or other
+            // internal payload content is never echoed to the client.
             _logger.LogError(
                 exception,
-                "IranDirect command failed.");
+                "Named-pipe command dispatch failed.");
 
             response = Failure(
                 "COMMAND_FAILED",
-                exception.Message);
+                FailureSafeMessage(exception));
         }
+
+    WriteResponse:
 
         string responseJson =
             JsonSerializer.Serialize(
@@ -225,6 +266,71 @@ public class NamedPipeCommandServer
         await writer.WriteLineAsync(
             responseJson.AsMemory(),
             cancellationToken);
+    }
+
+    /// <summary>
+    /// Outcome of inbound request parsing (BOUNDARY 1).
+    ///
+    /// <see cref="Rejection"/> is non-null when the document is well-formed but
+    /// must NOT be dispatched (unsupported protocol version, or a null/absent
+    /// request body). <see cref="Request"/> is non-null when a validated
+    /// ServiceRequest is available for dispatch.
+    /// </summary>
+    internal sealed record ParsedRequest(
+        ServiceRequest? Request,
+        ServiceResponse? Rejection);
+
+    /// <summary>
+    /// BOUNDARY 1 — inbound request parsing ONLY.
+    ///
+    /// Deserializes the request document and applies the shape/version checks
+    /// that decide WHETHER a command may be dispatched. This method never
+    /// invokes a command handler and never touches persistence, so a
+    /// <see cref="JsonException"/> escaping it can only mean the REQUEST was
+    /// malformed — which the caller maps to INVALID_JSON.
+    ///
+    /// The version/shape outcomes are returned as <see cref="ParsedRequest"/>
+    /// rejections (UNSUPPORTED_PROTOCOL / INVALID_REQUEST) so the established
+    /// per-outcome error codes are preserved exactly, and — like malformed
+    /// input — never dispatch a command. This is an internal testing seam, not
+    /// public API.
+    /// </summary>
+    internal static ParsedRequest ParseRequest(string requestJson)
+    {
+        ServiceRequest? request =
+            JsonSerializer.Deserialize<ServiceRequest>(
+                requestJson,
+                PathVeerJson.Options);
+
+        if (request is null)
+        {
+            return new ParsedRequest(
+                null,
+                new ServiceResponse
+                {
+                    Success = false,
+                    ErrorCode = "INVALID_REQUEST",
+                    Message = "The request was invalid."
+                });
+        }
+
+        if (request.ProtocolVersion != IpcProtocol.CurrentVersion)
+        {
+            return new ParsedRequest(
+                null,
+                new ServiceResponse
+                {
+                    Success = false,
+                    ErrorCode = "UNSUPPORTED_PROTOCOL",
+                    Message = "Protocol version " +
+                        $"{request.ProtocolVersion} is not supported."
+                });
+        }
+
+        // A validated request. BOUNDARY 2 (dispatch) is the caller's scope, so
+        // any downstream exception is handled there — never by the
+        // request-parsing INVALID_JSON path.
+        return new ParsedRequest(request, null);
     }
 
     private async Task<ServiceResponse> ExecuteWithTelemetryAsync(
@@ -704,6 +810,25 @@ public class NamedPipeCommandServer
             RuntimePlan = snapshot
         };
     }
+    /// <summary>
+    /// Client-facing message for a failed command dispatch.
+    ///
+    /// Exception messages from the persistence and IPC layers can carry
+    /// internal payload content — a <see cref="System.Text.Json.JsonException"/>
+    /// on a corrupted store names the offending line and the parsed fragment,
+    /// and path/IO messages can expose internal filesystem layout. None of that
+    /// belongs on the wire. The real exception (full type, message, stack) is
+    /// recorded server-side by the logger and its category by
+    /// <c>IpcDispatchTelemetry.CompleteFailure</c>, so operator diagnostics are
+    /// preserved without echoing raw state, credentials, or enrollment codes.
+    ///
+    /// Returns a fixed, category-free sentence: no exception text is inspected
+    /// or copied. The persisted <c>COMMAND_FAILED</c> error code is unchanged,
+    /// so the public IPC contract is untouched.
+    /// </summary>
+    private static string FailureSafeMessage(Exception exception) =>
+        "The command failed. See the PathVeer service event log for details.";
+
     private static ServiceResponse Failure(
         string errorCode,
         string message)
